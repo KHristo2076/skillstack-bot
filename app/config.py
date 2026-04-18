@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     bot_token: str
     webapp_url: str
     database_url: str
-    groq_api_key: str
+    anthropic_api_key: str
 
     model_config = {"env_file": str(_ENV_FILE), "env_file_encoding": "utf-8"}
 
