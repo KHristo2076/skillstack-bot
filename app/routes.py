@@ -5,6 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import select
 from telegram import Update
 
 from app.bot import bot_service
@@ -60,6 +61,25 @@ async def save_skill(data: SkillData):
 
     logger.info(f"Сохранён навык {data.skill} для пользователя {data.user_id}")
     return {"status": "success"}
+
+
+@router.get("/my-skills")
+async def get_my_skills(user_id: int):
+    """Возвращает все навыки пользователя"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(UserSkill).where(UserSkill.userId == user_id)
+        )
+        skills = result.scalars().all()
+        return {
+            "skills": [
+                {
+                    "skill": s.skillName,
+                    "progress": s.progress,
+                    "streak": s.streak
+                } for s in skills
+            ]
+        }
 
 
 @router.get("/app")
