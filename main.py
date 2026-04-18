@@ -1,68 +1,17 @@
 import logging
-import os
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import Application, CommandHandler, ContextTypes
-from dotenv import load_dotenv
 
-load_dotenv()
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
-TOKEN = os.getenv("BOT_TOKEN")
-WEBAPP_URL = os.getenv("WEBAPP_URL")  # потом заменим
+from app.bot import lifespan
+from app.routes import router
 
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация Telegram Application
-application = Application.builder().token(TOKEN).build()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await application.initialize()
-    yield
-    await application.shutdown()
-
-
 app = FastAPI(title="SkillStack Bot", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.include_router(router)
 
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton(text="🚀 Открыть SkillStack", web_app=WebAppInfo(url=WEBAPP_URL))]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        text="👋 Привет! Добро пожаловать в **SkillStack** — твой личный трекер навыков.\n\n"
-             "Нажми кнопку ниже и начни учиться уже сегодня!",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
-
-
-application.add_handler(CommandHandler("start", start_command))
-
-
-# Webhook для Render (продакшен)
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return {"status": "ok"}
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-        return {"status": "error"}
-
-
-@app.get("/")
-async def health():
-    return {"status": "✅ SkillStack Bot is running!"}
-
-
-# Локальный запуск (polling)
 if __name__ == "__main__":
-    print("🚀 Bot started in polling mode (local)")
-    application.run_polling()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
