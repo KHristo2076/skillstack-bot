@@ -5,17 +5,19 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.bot import bot_service
-from app.routes import router, db
+from app.database import init_db
+from app.routes import router
 
 logging.basicConfig(level=logging.INFO)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot_service.initialize()
-    await db.connect()
+    await init_db()
     yield
-    await db.disconnect()
     await bot_service.shutdown()
+
 
 app = FastAPI(title="SkillStack Bot", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
