@@ -7,12 +7,16 @@ from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import select
 from telegram import Update
+from groq import Groq
 
 from app.bot import bot_service
 from app.database import AsyncSessionLocal, UserSkill
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+groq_client = Groq(api_key=settings.groq_api_key)  # ← добавили
 
 
 class SkillData(BaseModel):
@@ -63,23 +67,57 @@ async def save_skill(data: SkillData):
     return {"status": "success"}
 
 
+@router.post("/start-lesson")
+async def start_lesson(data: dict):
+    """Генерируем урок через Groq AI"""
+    skill = data.get("skill")
+
+    prompt = f"""
+Ты — лучший преподаватель микро-уроков. Создай короткий урок (7–10 минут) по навыку: {skill}.
+
+Структура урока:
+1. Теория (3–4 коротких пункта)
+2. 3 вопроса с 4 вариантами ответов каждый (укажи правильный вариант)
+
+Ответ строго в JSON:
+{{
+  "title": "Урок по {skill}",
+  "theory": ["пункт1", "пункт2", "пункт3"],
+  "questions": [
+    {{"text": "вопрос1", "options": ["A", "B", "C", "D"], "correct": 0}},
+    {{"text": "вопрос2", "options": ["A", "B", "C", "D"], "correct": 2}},
+    {{"text": "вопрос3", "options": ["A", "B", "C", "D"], "correct": 1}}
+  ]
+}}
+"""
+
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            temperature=0.7,
+            max_tokens=1200,
+        )
+        lesson_json = chat_completion.choices[0].message.content
+        import json
+        lesson = json.loads(lesson_json)
+        return lesson
+    except Exception as e:
+        logger.error(f"AI error: {e}")
+        # fallback
+        return {
+            "title": f"Урок по {skill}",
+            "theory": ["AI временно недоступен", "Попробуй позже"],
+            "questions": []
+        }
+
+
 @router.get("/my-skills")
 async def get_my_skills(user_id: int):
-    """Возвращает все навыки пользователя"""
     async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(UserSkill).where(UserSkill.userId == user_id)
-        )
+        result = await session.execute(select(UserSkill).where(UserSkill.userId == user_id))
         skills = result.scalars().all()
-        return {
-            "skills": [
-                {
-                    "skill": s.skillName,
-                    "progress": s.progress,
-                    "streak": s.streak
-                } for s in skills
-            ]
-        }
+        return {"skills": [{"skill": s.skillName, "progress": s.progress, "streak": s.streak} for s in skills]}
 
 
 @router.get("/app")
@@ -89,34 +127,4 @@ async def serve_miniapp():
 
 @router.get("/")
 async def health():
-    return {"status": "✅ SkillStack Bot + DB is running!"}
-
-
-@router.post("/start-lesson")
-async def start_lesson(data: dict):
-    """Возвращает контент урока"""
-    skill = data.get("skill")
-
-    # Пока статичный контент. Позже можно сделать AI-генерацию
-    lesson = {
-        "skill": skill,
-        "title": f"Урок по {skill}",
-        "theory": [
-            "📌 Основы: что такое ...",
-            "🔥 Ключевой принцип №1",
-            "💡 Практический пример",
-        ],
-        "questions": [
-            {
-                "text": "Какой из вариантов правильный?",
-                "options": ["A", "B", "C", "D"],
-                "correct": 0
-            },
-            {
-                "text": "Что важнее всего в ...?",
-                "options": ["Скорость", "Качество", "Постоянство", "Всё вместе"],
-                "correct": 3
-            }
-        ]
-    }
-    return lesson
+    return {"status": "✅ SkillStack Bot + AI is running!"}
