@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-miniapp-url.com")  # потом заменим
+WEBAPP_URL = os.getenv("WEBAPP_URL")  # потом заменим
 
 logging.basicConfig(level=logging.INFO)
 
