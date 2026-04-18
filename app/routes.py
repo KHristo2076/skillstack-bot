@@ -7,7 +7,10 @@ from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import select
 from telegram import Update
-from groq import Groq
+import json
+import re
+
+from groq import AsyncGroq
 
 from app.bot import bot_service
 from app.database import AsyncSessionLocal, UserSkill
@@ -16,7 +19,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-groq_client = Groq(api_key=settings.groq_api_key)  # ← добавили
+groq_client = AsyncGroq(api_key=settings.groq_api_key)
 
 
 class SkillData(BaseModel):
@@ -92,14 +95,16 @@ async def start_lesson(data: dict):
 """
 
     try:
-        chat_completion = groq_client.chat.completions.create(
+        chat_completion = await groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             temperature=0.7,
             max_tokens=1200,
         )
-        lesson_json = chat_completion.choices[0].message.content
-        import json
+        raw = chat_completion.choices[0].message.content
+        # Strip markdown code fences if model wraps JSON in ```json ... ```
+        match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", raw)
+        lesson_json = match.group(1) if match else raw.strip()
         lesson = json.loads(lesson_json)
         return lesson
     except Exception as e:
