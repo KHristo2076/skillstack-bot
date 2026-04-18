@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     database_url: str
     anthropic_api_key: str
 
-    model_config = {"env_file": str(_ENV_FILE), "env_file_encoding": "utf-8"}
+    model_config = {"env_file": str(_ENV_FILE), "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 settings = Settings()
