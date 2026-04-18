@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInt, DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import BIGINT, DateTime, Integer, String, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -20,7 +20,7 @@ class UserSkill(Base):
     __tablename__ = "user_skills"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    userId: Mapped[int] = mapped_column(BigInt)
+    userId: Mapped[int] = mapped_column(BIGINT)
     skillName: Mapped[str] = mapped_column(String)
     progress: Mapped[int] = mapped_column(Integer, default=0)
     streak: Mapped[int] = mapped_column(Integer, default=0)
