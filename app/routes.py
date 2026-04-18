@@ -10,7 +10,7 @@ from telegram import Update
 import json
 import re
 
-from groq import AsyncGroq
+from anthropic import AsyncAnthropic
 
 from app.bot import bot_service
 from app.database import AsyncSessionLocal, UserSkill
@@ -19,7 +19,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-groq_client = AsyncGroq(api_key=settings.groq_api_key)
+anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 
 class SkillData(BaseModel):
@@ -95,13 +95,13 @@ async def start_lesson(data: dict):
 """
 
     try:
-        chat_completion = await groq_client.chat.completions.create(
+        response = await anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1500,
+            system="Ты образовательный ИИ. Отвечай строго чистым JSON без markdown-обёртки.",
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.7,
-            max_tokens=1200,
         )
-        raw = chat_completion.choices[0].message.content
+        raw = response.content[0].text
         # Strip markdown code fences if model wraps JSON in ```json ... ```
         match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", raw)
         lesson_json = match.group(1) if match else raw.strip()
