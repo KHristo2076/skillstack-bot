@@ -1,0 +1,20 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-py"
+}
+
+model UserSkill {
+  id         Int      @id @default(autoincrement())
+  userId     BigInt
+  skillName  String
+  progress   Int      @default(0)
+  streak     Int      @default(0)
+  lastLesson DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, skillName])
+}
