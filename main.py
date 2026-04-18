@@ -1,5 +1,4 @@
 import logging
-import subprocess
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,10 +12,6 @@ logging.basicConfig(level=logging.INFO)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot_service.initialize()
-
-    logging.info("Принудительно скачиваем движок Prisma...")
-    subprocess.run(["prisma", "py", "fetch"], check=True)
-
     await db.connect()
     yield
     await db.disconnect()
