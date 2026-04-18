@@ -6,7 +6,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.config import settings
 
-db_url = settings.database_url.replace("postgres://", "postgresql+asyncpg://")
+_raw_url = settings.database_url
+# Normalize both postgres:// and postgresql:// to postgresql+asyncpg://
+if _raw_url.startswith("postgres://"):
+    db_url = _raw_url.replace("postgres://", "postgresql+asyncpg://", 1)
+elif _raw_url.startswith("postgresql://"):
+    db_url = _raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+else:
+    db_url = _raw_url
 
 engine = create_async_engine(db_url, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
