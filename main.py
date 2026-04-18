@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -12,10 +13,18 @@ WEBAPP_URL = os.getenv("WEBAPP_URL")  # потом заменим
 
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="SkillStack Bot")
-
 # Инициализация Telegram Application
 application = Application.builder().token(TOKEN).build()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await application.initialize()
+    yield
+    await application.shutdown()
+
+
+app = FastAPI(title="SkillStack Bot", lifespan=lifespan)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
