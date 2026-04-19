@@ -1,82 +1,79 @@
 import logging
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from anthropic import AsyncAnthropic
 from telegram import Update
 
 from app.bot import bot_service
-from app.database import AsyncSessionLocal, UserSkill
+from app.database import AsyncSessionLocal, UserSkill, NotionPage, UserPremium
 from app.config import settings
+from app.notion_service import NotionService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+# Notion включён только если оба ключа заданы
+notion: NotionService | None = None
+if settings.notion_token and settings.notion_root_page_id:
+    notion = NotionService(settings.notion_token, settings.notion_root_page_id)
+
+
 # ─────────────────────────────────────────────
 # Вспомогательные функции
 # ─────────────────────────────────────────────
 
 def determine_level(progress: int, streak: int) -> dict:
-    """Определяем уровень и стиль урока по прогрессу пользователя."""
     if progress == 0 and streak == 0:
         return {
             "label": "новичок",
-            "theory_style": "объясняй очень просто, используй аналогии из повседневной жизни, избегай сложных терминов",
-            "question_style": "базовые вопросы на понимание простых концепций",
-            "lesson_number_hint": "это ПЕРВЫЙ урок пользователя — начни с самых основ",
+            "theory_style": "объясняй очень просто, используй аналогии из жизни",
+            "question_style": "базовые вопросы на понимание",
+            "lesson_number_hint": "это ПЕРВЫЙ урок — начни с самых основ",
         }
     elif progress < 30:
         return {
             "label": "начинающий",
-            "theory_style": "объясняй с нуля, но можно вводить термины с пояснением",
-            "question_style": "вопросы на понимание определений и базовых концепций",
+            "theory_style": "объясняй с нуля, вводи термины с пояснением",
+            "question_style": "вопросы на определения и базовые концепции",
             "lesson_number_hint": f"пройдено {streak} уроков — строй на предыдущих знаниях",
         }
     elif progress < 65:
         return {
             "label": "средний",
-            "theory_style": "объясняй практически, с примерами из реального применения, можно использовать термины",
-            "question_style": "вопросы на применение знаний, выбор правильного подхода",
-            "lesson_number_hint": f"прогресс {progress}% — углубляй и расширяй знания",
+            "theory_style": "практически, с примерами из реального применения",
+            "question_style": "вопросы на применение, выбор правильного подхода",
+            "lesson_number_hint": f"прогресс {progress}% — углубляй знания",
         }
     else:
         return {
             "label": "продвинутый",
-            "theory_style": "углублённые концепции, нюансы, edge cases, best practices",
-            "question_style": "сложные вопросы на понимание тонкостей и профессиональный выбор",
-            "lesson_number_hint": f"высокий прогресс {progress}% — фокус на мастерстве и деталях",
+            "theory_style": "углублённо: нюансы, edge cases, best practices",
+            "question_style": "сложные вопросы на тонкости и профессиональный выбор",
+            "lesson_number_hint": f"высокий прогресс {progress}% — фокус на мастерстве",
         }
 
 
 def safe_parse_json(raw: str) -> dict:
-    """Надёжный парсер JSON — находит объект даже если вокруг мусор."""
-    # Убираем markdown-обёртку если есть
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-
-    # Ищем первый { и последний }
     start = cleaned.find("{")
     end = cleaned.rfind("}") + 1
-
     if start == -1 or end <= start:
-        raise ValueError(f"JSON-объект не найден в ответе модели. Raw: {raw[:200]}")
-
-    json_str = cleaned[start:end]
-    return json.loads(json_str)
+        raise ValueError(f"JSON не найден. Raw: {raw[:200]}")
+    return json.loads(cleaned[start:end])
 
 
 def validate_lesson(lesson: dict) -> bool:
-    """Проверяем что урок имеет нужную структуру."""
-    required = ["title", "theory", "questions"]
-    for key in required:
+    for key in ["title", "theory", "questions"]:
         if key not in lesson:
             return False
     if not isinstance(lesson["theory"], list) or len(lesson["theory"]) < 2:
@@ -89,6 +86,58 @@ def validate_lesson(lesson: dict) -> bool:
     return True
 
 
+async def is_premium(user_id: int) -> bool:
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(UserPremium).where(UserPremium.userId == user_id)
+        )
+        row = result.scalar_one_or_none()
+        if not row or not row.isPremium:
+            return False
+        if row.premiumUntil and row.premiumUntil < datetime.utcnow():
+            return False
+        return True
+
+
+# ─────────────────────────────────────────────
+# Notion: фоновая запись урока
+# ─────────────────────────────────────────────
+
+async def write_lesson_to_notion(
+    user_id: int,
+    username: str,
+    skill: str,
+    lesson_title: str,
+    theory: list[str],
+) -> None:
+    if not notion:
+        return
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(NotionPage).where(NotionPage.userId == user_id)
+            )
+            notion_row = result.scalar_one_or_none()
+
+            if notion_row is None:
+                page_id = await notion.create_user_page(username, user_id)
+                notion_row = NotionPage(
+                    userId=user_id,
+                    pageId=page_id,
+                    trialStartedAt=datetime.utcnow(),
+                )
+                session.add(notion_row)
+                await session.commit()
+
+            user_page_id = notion_row.pageId
+
+        skill_page_id = await notion.get_or_create_skill_page(user_page_id, skill)
+        await notion.append_lesson(skill_page_id, lesson_title, theory)
+
+    except Exception as e:
+        logger.error(f"Notion write error для {user_id}: {e}")
+
+
 # ─────────────────────────────────────────────
 # Модели данных
 # ─────────────────────────────────────────────
@@ -97,6 +146,9 @@ class SkillData(BaseModel):
     user_id: int
     skill: str
     action: str = "select"
+    lesson_title: str = ""
+    theory: list[str] = []
+    username: str = "user"
 
 
 class ChatMessage(BaseModel):
@@ -123,7 +175,7 @@ async def webhook(request: Request):
 
 
 @router.post("/save-skill")
-async def save_skill(data: SkillData):
+async def save_skill(data: SkillData, background_tasks: BackgroundTasks):
     async with AsyncSessionLocal() as session:
         stmt = insert(UserSkill).values(
             userId=data.user_id,
@@ -137,34 +189,38 @@ async def save_skill(data: SkillData):
             stmt = stmt.on_conflict_do_update(
                 index_elements=["userId", "skillName"],
                 set_={
-                    "progress": UserSkill.progress + 12,  # +12% за урок
+                    "progress": UserSkill.progress + 12,
                     "streak": UserSkill.streak + 1,
                     "lastLesson": datetime.utcnow(),
                 },
             )
+            # Пишем в Notion в фоне
+            if notion and data.lesson_title and data.theory:
+                background_tasks.add_task(
+                    write_lesson_to_notion,
+                    data.user_id,
+                    data.username,
+                    data.skill,
+                    data.lesson_title,
+                    data.theory,
+                )
         else:
             stmt = stmt.on_conflict_do_nothing(index_elements=["userId", "skillName"])
 
         await session.execute(stmt)
         await session.commit()
 
-    logger.info(f"Сохранён навык '{data.skill}' для пользователя {data.user_id}")
     return {"status": "success"}
 
 
 @router.post("/start-lesson")
 async def start_lesson(data: dict):
-    """
-    Генерирует персонализированный урок через Claude API.
-    Учитывает прогресс пользователя, уровень, количество пройденных уроков.
-    """
     skill = data.get("skill", "")
     user_id = data.get("user_id")
 
     if not skill:
         return {"error": "Навык не указан"}
 
-    # ── Шаг 1: получаем прогресс из БД ──────────────────
     user_progress = 0
     user_streak = 0
 
@@ -182,38 +238,23 @@ async def start_lesson(data: dict):
                     user_progress = row.progress
                     user_streak = row.streak
         except Exception as e:
-            logger.warning(f"Не удалось получить прогресс пользователя: {e}")
+            logger.warning(f"Не удалось получить прогресс: {e}")
 
-    # ── Шаг 2: определяем уровень ────────────────────────
     level = determine_level(user_progress, user_streak)
 
-    # ── Шаг 3: формируем промпт ──────────────────────────
     system_prompt = """Ты — эксперт-преподаватель системы микро-обучения SkillStack.
-Твоя задача — создавать короткие, плотные, практичные уроки.
+КРИТИЧЕСКИ ВАЖНО: твой ответ — ТОЛЬКО валидный JSON. Без markdown, без пояснений."""
 
-КРИТИЧЕСКИ ВАЖНО: твой ответ должен быть ТОЛЬКО валидным JSON-объектом.
-— Никаких слов до или после JSON
-— Никаких markdown-блоков (``` или ~~~)
-— Никаких комментариев или пояснений
-— Только чистый JSON, начинающийся с { и заканчивающийся }"""
+    user_prompt = f"""Создай микро-урок по навыку: "{skill}"
 
-    user_prompt = f"""Создай микро-урок (7-10 минут) по навыку: "{skill}"
-
-Профиль студента:
+Профиль:
 - Уровень: {level['label']}
 - {level['lesson_number_hint']}
-- Стиль объяснения: {level['theory_style']}
-- Стиль вопросов: {level['question_style']}
-
-Требования к уроку:
-- Название: конкретное и мотивирующее (НЕ просто "Урок по {skill}")
-- Теория: ровно 3 пункта, каждый — одно чёткое, полезное утверждение или факт
-- Вопросы: 3 вопроса, все варианты ответов правдоподобные (не очевидный мусор)
-- correct — индекс правильного ответа (0, 1, 2 или 3)
+- Стиль: {level['theory_style']}
 
 Верни строго этот JSON:
 {{
-  "title": "...",
+  "title": "конкретное название (не 'Урок по X')",
   "level": "{level['label']}",
   "theory": ["пункт 1", "пункт 2", "пункт 3"],
   "questions": [
@@ -223,7 +264,6 @@ async def start_lesson(data: dict):
   ]
 }}"""
 
-    # ── Шаг 4: вызываем Claude API ───────────────────────
     raw = ""
     try:
         response = await anthropic_client.messages.create(
@@ -234,68 +274,48 @@ async def start_lesson(data: dict):
         )
         raw = response.content[0].text
         lesson = safe_parse_json(raw)
-
         if not validate_lesson(lesson):
-            raise ValueError(f"Невалидная структура урока: {list(lesson.keys())}")
-
-        logger.info(f"Урок сгенерирован: '{lesson['title']}' для пользователя {user_id}, уровень {level['label']}")
+            raise ValueError(f"Невалидная структура: {list(lesson.keys())}")
         return lesson
 
     except Exception as e:
-        logger.error(f"Ошибка генерации урока: {e}. Raw: {raw[:300] if raw else 'нет ответа'}")
-        # Фоллбэк — минимальный урок чтобы пользователь не видел белый экран
+        logger.error(f"Ошибка генерации: {e}. Raw: {raw[:300] if raw else 'нет'}")
         return {
             "title": f"Основы {skill}",
             "level": level["label"],
             "theory": [
-                "AI-генератор временно недоступен. Попробуй обновить через минуту.",
+                "AI-генератор временно недоступен. Попробуй через минуту.",
                 "Пока можешь повторить материал из предыдущих уроков.",
-                "Если проблема сохраняется — напиши в поддержку."
+                "Если проблема сохраняется — напиши в поддержку.",
             ],
-            "questions": [
-                {
-                    "text": "Ты готов продолжить обучение позже?",
-                    "options": ["Да, жду!", "Конечно", "Обязательно", "Уже жду"],
-                    "correct": 0
-                }
-            ]
+            "questions": [{
+                "text": "Ты готов продолжить обучение позже?",
+                "options": ["Да, жду!", "Конечно", "Обязательно", "Уже жду"],
+                "correct": 0,
+            }],
         }
 
 
 @router.post("/ask-ai")
 async def ask_ai(data: ChatMessage):
-    """
-    AI-ментор внутри урока — студент задаёт вопрос по теме.
-    Это Premium-фича: в будущем ограничить для free-пользователей.
-    """
     if not data.question.strip():
         return {"answer": "Задай вопрос — я отвечу!"}
 
-    context_block = ""
-    if data.lesson_context:
-        context_block = f"\nТекущая тема урока:\n{data.lesson_context}\n"
+    context_block = f"\nТема:\n{data.lesson_context}\n" if data.lesson_context else ""
 
     try:
         response = await anthropic_client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=400,
-            system=f"""Ты — дружелюбный AI-ментор по теме "{data.skill}" в приложении SkillStack.
+            system=f"""Ты — AI-ментор по теме "{data.skill}" в SkillStack.
 {context_block}
-Правила ответа:
-— Коротко: 2-4 предложения максимум
-— Дружелюбно, на "ты", без формальностей
-— На русском языке
-— Если вопрос не по теме — мягко верни к теме
-— Не повторяй вопрос пользователя в ответе""",
+Отвечай коротко (2-4 предложения), дружелюбно, на "ты", на русском.""",
             messages=[{"role": "user", "content": data.question}],
         )
-        answer = response.content[0].text.strip()
-        logger.info(f"AI-ментор ответил пользователю {data.user_id}")
-        return {"answer": answer}
-
+        return {"answer": response.content[0].text.strip()}
     except Exception as e:
-        logger.error(f"Ошибка AI-ментора: {e}")
-        return {"answer": "Не смог ответить прямо сейчас. Попробуй переформулировать — или чуть позже!"}
+        logger.error(f"AI-ментор ошибка: {e}")
+        return {"answer": "Не смог ответить. Попробуй переформулировать!"}
 
 
 @router.get("/my-skills")
@@ -309,13 +329,98 @@ async def get_my_skills(user_id: int):
             "skills": [
                 {
                     "skill": s.skillName,
-                    "progress": min(s.progress, 100),  # не даём превысить 100%
+                    "progress": min(s.progress, 100),
                     "streak": s.streak,
                     "level": determine_level(s.progress, s.streak)["label"],
                 }
                 for s in skills
             ]
         }
+
+
+@router.get("/notion-link")
+async def get_notion_link(user_id: int):
+    """Ссылка на Notion — только для Premium."""
+    premium = await is_premium(user_id)
+    if not premium:
+        return {
+            "available": False,
+            "message": "Конспекты в Notion доступны с Premium 🔒",
+        }
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(NotionPage).where(NotionPage.userId == user_id)
+        )
+        row = result.scalar_one_or_none()
+
+    if not row:
+        return {"available": False, "message": "Конспект появится после первого урока"}
+
+    page_url = f"https://notion.so/{row.pageId.replace('-', '')}"
+    return {"available": True, "url": page_url}
+
+
+@router.post("/cron/cleanup-expired-trials")
+async def cleanup_expired_trials(request: Request):
+    """Вызывать ежедневно через cron-job.org."""
+    secret = request.headers.get("X-Cron-Secret", "")
+    if secret != settings.notion_token[:16]:
+        return {"error": "Unauthorized"}
+
+    now = datetime.utcnow()
+    warn_threshold = now - timedelta(days=27)
+    delete_threshold = now - timedelta(days=30)
+
+    async with AsyncSessionLocal() as session:
+        pages_result = await session.execute(select(NotionPage))
+        all_pages = pages_result.scalars().all()
+
+        warned = 0
+        deleted = 0
+
+        for page in all_pages:
+            uid = page.userId
+            prem_result = await session.execute(
+                select(UserPremium).where(UserPremium.userId == uid)
+            )
+            prem = prem_result.scalar_one_or_none()
+            has_premium = (
+                prem is not None
+                and prem.isPremium
+                and (prem.premiumUntil is None or prem.premiumUntil > now)
+            )
+            if has_premium:
+                continue
+
+            if page.trialStartedAt <= warn_threshold and not page.warningSent:
+                try:
+                    await bot_service.application.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            "⚠️ Через 3 дня твои конспекты в Notion будут удалены.\n\n"
+                            "Активируй Premium, чтобы сохранить все материалы навсегда! 🔒"
+                        ),
+                    )
+                    page.warningSent = True
+                    await session.commit()
+                    warned += 1
+                except Exception as e:
+                    logger.error(f"Предупреждение {uid}: {e}")
+
+            if page.trialStartedAt <= delete_threshold:
+                try:
+                    if notion:
+                        await notion.delete_user_page(page.pageId)
+                    await session.execute(
+                        delete(NotionPage).where(NotionPage.userId == uid)
+                    )
+                    await session.commit()
+                    deleted += 1
+                except Exception as e:
+                    logger.error(f"Удаление {uid}: {e}")
+
+    return {"warned": warned, "deleted": deleted}
 
 
 @router.get("/app")
