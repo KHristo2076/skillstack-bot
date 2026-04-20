@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot_service.initialize()
-    await init_db()
+    # await init_db()
     yield
     await bot_service.shutdown()
 
