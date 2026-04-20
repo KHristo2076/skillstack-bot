@@ -109,6 +109,8 @@ class Question(BaseModel):
     criteria: str | None = None
     # нужна ли AI-проверка (для code и translation всегда true)
     ai_check: bool = False
+    # для assessment: какой блок трека покрывает этот вопрос (1..N)
+    covers_block: int | None = None
 
 
 class TopicContent(BaseModel):
@@ -207,6 +209,9 @@ class SubmitAssessmentRequest(BaseModel):
     user_id: int
     track_id: int
     answers: list[AnswerItem]
+    # фронт обязан передать обратно вопросы, полученные из /start-assessment
+    # (чтобы не перегенерировать и не потерять covers_block)
+    questions: list[Question]
 
 
 class SubmitAssessmentResponse(BaseModel):
