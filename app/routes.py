@@ -346,7 +346,18 @@ async def cleanup_expired_trials(request: Request):
 
 @router.get("/app")
 async def serve_miniapp():
-    return FileResponse("static/index.html")
+    return FileResponse(
+        "static/index.html",
+        headers={
+            # Запрещаем кэширование index.html — он ссылается на
+            # assets/index-XXXX.js с hash-именем, которое меняется при каждом
+            # билде. Если index.html кэшируется, Telegram/браузер будет
+            # просить несуществующие старые ассеты → "Not Found" / чёрный экран.
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @router.get("/")
