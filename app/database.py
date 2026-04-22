@@ -21,7 +21,16 @@ elif _raw_url.startswith("postgresql://"):
 else:
     db_url = _raw_url
 
-engine = create_async_engine(db_url, echo=False)
+engine = create_async_engine(
+    db_url,
+    echo=False,
+    # Проверяем живость коннекта перед каждым использованием (SELECT 1).
+    # Render/Heroku/Neon закрывают idle-коннекты — без этого получаем
+    # "connection is closed" когда pool отдаёт мёртвый коннект.
+    pool_pre_ping=True,
+    # Пересоздаём коннекты каждые 5 минут, чтобы не копить мёртвые.
+    pool_recycle=300,
+)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
