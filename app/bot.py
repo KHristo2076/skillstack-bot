@@ -14,6 +14,7 @@ class BotService:
     def __init__(self):
         self.application = Application.builder().token(settings.bot_token).build()
         self.application.add_handler(CommandHandler("start", self.start_command))
+        self._initialized = False
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
@@ -27,10 +28,24 @@ class BotService:
         )
 
     async def initialize(self):
-        await self.application.initialize()
+        """Инициализация бота. Ошибки логируются, но не блокируют старт приложения.
+        Это важно для dev-среды, где Telegram API может быть временно недоступен
+        (нет интернета, VPN, блокировки)."""
+        try:
+            await self.application.initialize()
+            self._initialized = True
+            logger.info("✅ Telegram bot initialized")
+        except Exception as e:
+            logger.error(f"⚠️  Bot init failed (Telegram API unreachable?): {e}")
+            logger.error("⚠️  App will run WITHOUT Telegram integration — /webhook won't work")
+            self._initialized = False
 
     async def shutdown(self):
-        await self.application.shutdown()
+        if self._initialized:
+            try:
+                await self.application.shutdown()
+            except Exception as e:
+                logger.error(f"Bot shutdown error: {e}")
 
 
 bot_service = BotService()

@@ -16,7 +16,7 @@ import re
 from datetime import datetime
 
 from anthropic import AsyncAnthropic
-from sqlalchemy import select
+from sqlalchemy import case as sa_case, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
@@ -174,12 +174,17 @@ async def submit_assessment(
     user_id: int,
     track_id: int,
     answers: list[AnswerItem],
-    questions: list[dict],  # вопросы, которые фронт вернул обратно (с covers_block)
+    questions: list[dict],  # вопросы с фронта (с covers_block)
 ) -> SubmitAssessmentResponse | None:
     """
-    Проверяет все ответы, считает по блокам какие юзер знает,
-    определяет стартовую тему. Все темы до неё → status='passed' source='assessment'.
+    Архитектура (важно для стабильности с asyncpg):
+    1) Сессия A: читаем Track + блоки + первые темы → вытаскиваем в плоские структуры
+    2) Без сессии: AI-проверка 7 ответов + генерация summary (долго)
+    3) Сессия B: одной транзакцией пишем все изменения
+
+    Нельзя держать сессию открытой во время вызовов Claude — коннект asyncpg закрывается.
     """
+    # ── Сессия A: читаем всё что нужно, сохраняем в обычные переменные ──
     async with AsyncSessionLocal() as session:
         track_res = await session.execute(
             select(Track).where(Track.id == track_id, Track.user_id == user_id)
@@ -188,8 +193,41 @@ async def submit_assessment(
         if not track:
             return None
 
-    # 1. Проверяем ответы. По каждому блоку собираем статистику.
-    block_scores: dict[int, list[float]] = {}  # covers_block → [score,...]
+        track_name = track.name
+        track_total_topics = track.total_topics
+
+        # Все блоки трека
+        blocks_res = await session.execute(
+            select(Block).where(Block.track_id == track_id).order_by(Block.order_num)
+        )
+        all_blocks = blocks_res.scalars().all()
+
+        # Для каждого блока — id и order_num (плоско, без ORM)
+        blocks_flat = [
+            {"id": b.id, "order_num": b.order_num} for b in all_blocks
+        ]
+
+        # Все темы трека (с блоком) — понадобятся для определения стартовой темы
+        # и для массового обновления "все темы до X"
+        topics_res = await session.execute(
+            select(Topic.id, Topic.title, Topic.block_id, Topic.order_num, Block.order_num.label("block_order"))
+            .join(Block, Topic.block_id == Block.id)
+            .where(Block.track_id == track_id)
+            .order_by(Block.order_num, Topic.order_num)
+        )
+        all_topics_flat = [
+            {
+                "id": row.id,
+                "title": row.title,
+                "block_id": row.block_id,
+                "order_num": row.order_num,
+                "block_order": row.block_order,
+            }
+            for row in topics_res.all()
+        ]
+
+    # ── Вне сессии: проверяем ответы через AI ──
+    block_scores: dict[int, list[float]] = {}
     total_score = 0.0
 
     for i, q in enumerate(questions):
@@ -199,25 +237,23 @@ async def submit_assessment(
             result = await check_answer(q, answers[i].value)
             score = result.score
         total_score += score
-
         covers = q.get("covers_block", 1)
         block_scores.setdefault(covers, []).append(score)
 
     score_pct = (total_score / len(questions)) * 100 if questions else 0.0
 
-    # 2. Определяем последний "освоенный" блок:
-    # блок считается освоенным, если средний score по нему ≥ 0.7
-    blocks_sorted = sorted(block_scores.keys())
+    # Определяем последний освоенный блок (идём по порядку — как только
+    # встречаем блок со средним < 0.7, останавливаемся)
     last_passed_block_num = 0
-    for block_num in blocks_sorted:
+    for block_num in sorted(block_scores.keys()):
         scores = block_scores[block_num]
         avg = sum(scores) / len(scores) if scores else 0.0
         if avg >= 0.7:
             last_passed_block_num = block_num
         else:
-            break  # как только встретили не освоенный — стоп
+            break
 
-    # 3. Определяем уровень
+    # Уровень
     if score_pct >= 80:
         level = "senior"
     elif score_pct >= 50:
@@ -225,78 +261,63 @@ async def submit_assessment(
     else:
         level = "beginner"
 
-    # 4. Находим стартовую тему (первая тема первого неосвоенного блока)
+    # Определяем стартовую тему (по плоским данным из сессии A)
+    start_topic_id: int | None = None
+    start_topic_title: str | None = None
+
+    first_unmastered_order = last_passed_block_num + 1
+
+    # Первая тема первого неосвоенного блока
+    for t in all_topics_flat:
+        if t["block_order"] == first_unmastered_order and t["order_num"] == 1:
+            start_topic_id = t["id"]
+            start_topic_title = t["title"]
+            break
+
+    # Если все блоки освоены и стартовой темы нет — ставим на последнюю
+    if start_topic_id is None and last_passed_block_num > 0 and all_topics_flat:
+        last_topic = all_topics_flat[-1]
+        start_topic_id = last_topic["id"]
+        start_topic_title = last_topic["title"]
+
+    # Список id тем, которые пометим как passed
+    topic_ids_to_pass: list[int] = [
+        t["id"] for t in all_topics_flat if t["block_order"] <= last_passed_block_num
+    ]
+    skipped_count = len(topic_ids_to_pass)
+
+    # Генерим summary через Claude (вне сессии — AI вызов)
+    summary = await _generate_summary(
+        track_name, level, score_pct, skipped_count, start_topic_title,
+    )
+
+    # ── Сессия B: одной транзакцией пишем все изменения ──
+    now = datetime.utcnow()
     async with AsyncSessionLocal() as session:
-        blocks_res = await session.execute(
-            select(Block).where(Block.track_id == track_id).order_by(Block.order_num)
-        )
-        all_blocks = blocks_res.scalars().all()
-
-        # Первый неосвоенный блок
-        first_unmastered_order = last_passed_block_num + 1
-
-        start_topic_id: int | None = None
-        start_topic_title: str | None = None
-        skipped_count = 0
-
-        target_block = next((b for b in all_blocks if b.order_num == first_unmastered_order), None)
-        if target_block:
-            t_res = await session.execute(
-                select(Topic).where(Topic.block_id == target_block.id).order_by(Topic.order_num).limit(1)
+        # 1. Массово помечаем темы до стартовой как passed
+        for tid in topic_ids_to_pass:
+            stmt = pg_insert(UserTopicProgress).values(
+                user_id=user_id,
+                topic_id=tid,
+                status="passed",
+                score_pct=100.0,
+                attempts=0,
+                passed_at=now,
+                source="assessment",
             )
-            first_topic = t_res.scalar_one_or_none()
-            if first_topic:
-                start_topic_id = first_topic.id
-                start_topic_title = first_topic.title
-        elif last_passed_block_num > 0:
-            # Все блоки освоены — ставим на последнюю тему последнего блока
-            last_block = all_blocks[-1] if all_blocks else None
-            if last_block:
-                t_res = await session.execute(
-                    select(Topic).where(Topic.block_id == last_block.id).order_by(Topic.order_num.desc()).limit(1)
-                )
-                last_topic = t_res.scalar_one_or_none()
-                if last_topic:
-                    start_topic_id = last_topic.id
-                    start_topic_title = last_topic.title
-
-        # 5. Помечаем все темы ДО стартовой как passed (source='assessment')
-        if last_passed_block_num > 0:
-            topics_to_pass_res = await session.execute(
-                select(Topic.id)
-                .join(Block, Topic.block_id == Block.id)
-                .where(
-                    Block.track_id == track_id,
-                    Block.order_num <= last_passed_block_num,
-                )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["user_id", "topic_id"],
+                set_={
+                    "status": "passed",
+                    "score_pct": 100.0,
+                    "passed_at": now,
+                    "source": "assessment",
+                },
             )
-            topic_ids_to_pass = [tid for tid, in topics_to_pass_res.all()]
+            await session.execute(stmt)
 
-            for tid in topic_ids_to_pass:
-                stmt = pg_insert(UserTopicProgress).values(
-                    user_id=user_id,
-                    topic_id=tid,
-                    status="passed",
-                    score_pct=100.0,
-                    attempts=0,
-                    passed_at=datetime.utcnow(),
-                    source="assessment",
-                )
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["user_id", "topic_id"],
-                    set_={
-                        "status": "passed",
-                        "score_pct": 100.0,
-                        "passed_at": datetime.utcnow(),
-                        "source": "assessment",
-                    },
-                )
-                await session.execute(stmt)
-
-            skipped_count = len(topic_ids_to_pass)
-
-        # 6. Разблокируем стартовую тему
-        if start_topic_id:
+        # 2. Разблокируем стартовую тему (только если она ещё не passed)
+        if start_topic_id is not None and start_topic_id not in topic_ids_to_pass:
             stmt = pg_insert(UserTopicProgress).values(
                 user_id=user_id,
                 topic_id=start_topic_id,
@@ -304,13 +325,16 @@ async def submit_assessment(
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=["user_id", "topic_id"],
-                # Не перезаписывать если уже passed
-                set_={"status": "available"},
-                where=(UserTopicProgress.status != "passed"),
+                set_={
+                    "status": sa_case(
+                        (UserTopicProgress.status == "passed", "passed"),
+                        else_="available",
+                    ),
+                },
             )
             await session.execute(stmt)
 
-        # 7. Обновляем UserTrack: mode='assessed', progress_pct
+        # 3. Обновляем UserTrack: mode='assessed', progress_pct
         ut_res = await session.execute(
             select(UserTrack).where(
                 UserTrack.user_id == user_id,
@@ -320,21 +344,20 @@ async def submit_assessment(
         ut = ut_res.scalar_one_or_none()
         if ut:
             ut.mode = "assessed"
-            ut.progress_pct = (skipped_count / track.total_topics * 100) if track.total_topics else 0.0
-            ut.last_activity = datetime.utcnow()
+            ut.progress_pct = (
+                (skipped_count / track_total_topics * 100)
+                if track_total_topics else 0.0
+            )
+            ut.last_activity = now
 
-        # 8. Генерим summary через Claude для UX
-        summary = await _generate_summary(track.name, level, score_pct, skipped_count, start_topic_title)
-
-        # 9. Сохраняем запись Assessment
-        assessment = Assessment(
+        # 4. Сохраняем запись Assessment
+        session.add(Assessment(
             user_id=user_id,
             track_id=track_id,
             score_pct=score_pct,
             level=level,
             start_topic_id=start_topic_id,
-        )
-        session.add(assessment)
+        ))
 
         await session.commit()
 

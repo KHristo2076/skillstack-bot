@@ -1,14 +1,19 @@
 """
 notion_service.py
 
-Структура в Notion:
+Структура в Notion (вложенная):
   [корневая страница пользователя]
-  └── 📚 Java Senior          ← страница-блок (навык)
-      ├── 🔹 Spring            ← toggle heading (тема урока)
-      │   ├── Бины             ← bullet (пункт теории)
-      │   └── IoC контейнер    ← bullet
-      └── 🔹 Collections
-          └── ArrayList vs LinkedList
+  └── 📚 Основы Python                  ← страница трека
+      ├── 🔻 Блок 1: Синтаксис           ← toggle блока
+      │   ├── 🔹 Типы данных             ← toggle темы
+      │   │   ├── • пункт 1              ← bullet (пункт теории)
+      │   │   ├── • пункт 2
+      │   │   └── • пункт 3
+      │   └── 🔹 Переменные
+      │       └── • ...
+      └── 🔻 Блок 2: Управляющие конструкции
+          └── 🔹 Циклы
+              └── • ...
 """
 
 import logging
@@ -80,10 +85,9 @@ class NotionService:
 
     async def get_or_create_skill_page(self, user_page_id: str, skill: str) -> str:
         """
-        Ищет дочернюю страницу навыка. Если нет — создаёт.
-        Возвращает page_id страницы навыка.
+        Страница трека (направления) внутри страницы пользователя.
+        Ищет существующую; если нет — создаёт. Возвращает page_id страницы трека.
         """
-        # Получаем дочерние блоки корневой страницы пользователя
         data = await self._get(
             f"https://api.notion.com/v1/blocks/{user_page_id}/children?page_size=100"
         )
@@ -93,7 +97,7 @@ class NotionService:
                 if title == skill:
                     return block["id"]
 
-        # Не нашли — создаём страницу навыка
+        # Не нашли — создаём
         payload = {
             "parent": {"page_id": user_page_id},
             "icon": {"type": "emoji", "emoji": "📚"},
@@ -110,23 +114,109 @@ class NotionService:
         return data["id"]
 
     # ─────────────────────────────────────────────
-    # Запись урока
+    # ВЛОЖЕННАЯ ЗАПИСЬ: Блок → Тема → Пункты (v2)
     # ─────────────────────────────────────────────
 
-    async def append_lesson(
+    async def _list_children(self, block_id: str) -> list[dict]:
+        """Все дочерние блоки указанного блока (с пагинацией)."""
+        results: list[dict] = []
+        url = f"https://api.notion.com/v1/blocks/{block_id}/children?page_size=100"
+        while True:
+            data = await self._get(url)
+            results.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            url = (
+                f"https://api.notion.com/v1/blocks/{block_id}/children"
+                f"?page_size=100&start_cursor={cursor}"
+            )
+        return results
+
+    @staticmethod
+    def _toggle_plain_text(toggle_block: dict) -> str:
+        """Достаёт простой текст из toggle-блока для сравнения с заголовком."""
+        rich = toggle_block.get("toggle", {}).get("rich_text", [])
+        return "".join(r.get("plain_text", "") for r in rich)
+
+    async def get_or_create_block_toggle(
         self,
-        skill_page_id: str,
-        lesson_title: str,
+        track_page_id: str,
+        block_title: str,
+    ) -> str:
+        """
+        Ищет toggle блока с указанным заголовком внутри страницы трека.
+        Если нет — создаёт. Возвращает block_id toggle'а.
+
+        Заголовок toggle'а = '▸ {block_title}'. По этой подстроке ищем.
+        """
+        needle = f"▸ {block_title}"
+        children = await self._list_children(track_page_id)
+
+        for b in children:
+            if b.get("type") != "toggle":
+                continue
+            text = self._toggle_plain_text(b)
+            if text == needle or text.strip() == needle.strip():
+                return b["id"]
+
+        # Не нашли — создаём пустой toggle блока
+        toggle_block = {
+            "object": "block",
+            "type": "toggle",
+            "toggle": {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": needle},
+                        "annotations": {"bold": True, "color": "green"},
+                    }
+                ],
+                "children": [],
+            },
+        }
+        data = await self._post(
+            f"https://api.notion.com/v1/blocks/{track_page_id}/children",
+            {"children": [toggle_block]},
+        )
+        return data["results"][0]["id"]
+
+    async def append_topic_nested(
+        self,
+        track_page_id: str,
+        block_title: str,
+        topic_title: str,
         theory_points: list[str],
     ) -> None:
         """
-        Добавляет урок в страницу навыка в виде:
-          🔹 <lesson_title>   ← toggle
-              • пункт 1
-              • пункт 2
-              • пункт 3
+        Вложенная запись урока:
+          Страница трека
+          └── Toggle блока (создаётся при первом уроке блока)
+              └── Toggle темы
+                  ├── bullet 1
+                  ├── bullet 2
+                  └── bullet 3
+
+        Если toggle темы с таким же названием уже есть внутри блока — пропускаем
+        (идемпотентность на случай повторного прохождения).
         """
-        # Bullet-пункты внутри toggle
+        # 1. Находим/создаём toggle блока
+        block_toggle_id = await self.get_or_create_block_toggle(track_page_id, block_title)
+
+        # 2. Проверяем, нет ли уже такой темы
+        needle_topic = f"🔹 {topic_title}"
+        existing = await self._list_children(block_toggle_id)
+        for b in existing:
+            if b.get("type") != "toggle":
+                continue
+            text = self._toggle_plain_text(b)
+            if text == needle_topic or text.strip() == needle_topic.strip():
+                logger.info(
+                    f"Notion: тема '{topic_title}' уже есть в блоке '{block_title}', пропускаем"
+                )
+                return
+
+        # 3. Bullet-пункты внутри toggle темы
         bullet_children = [
             {
                 "object": "block",
@@ -138,6 +228,55 @@ class NotionService:
             for point in theory_points
         ]
 
+        # 4. Toggle темы с bullet'ами
+        topic_toggle = {
+            "object": "block",
+            "type": "toggle",
+            "toggle": {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": needle_topic},
+                        "annotations": {"bold": True},
+                    }
+                ],
+                "children": bullet_children,
+            },
+        }
+
+        # 5. Добавляем topic-toggle внутрь toggle блока
+        await self._post(
+            f"https://api.notion.com/v1/blocks/{block_toggle_id}/children",
+            {"children": [topic_toggle]},
+        )
+        logger.info(
+            f"Notion: тема '{topic_title}' записана в блок '{block_title}'"
+        )
+
+    # ─────────────────────────────────────────────
+    # Старый плоский метод (оставляем для совместимости)
+    # ─────────────────────────────────────────────
+
+    async def append_lesson(
+        self,
+        skill_page_id: str,
+        lesson_title: str,
+        theory_points: list[str],
+    ) -> None:
+        """
+        ⚠️  DEPRECATED: используй append_topic_nested с блоком.
+        Плоская запись — toggle с bullet'ами прямо в странице трека.
+        """
+        bullet_children = [
+            {
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {
+                    "rich_text": [{"type": "text", "text": {"content": point}}]
+                },
+            }
+            for point in theory_points
+        ]
         toggle_block = {
             "object": "block",
             "type": "toggle",
@@ -152,12 +291,11 @@ class NotionService:
                 "children": bullet_children,
             },
         }
-
         await self._post(
             f"https://api.notion.com/v1/blocks/{skill_page_id}/children",
             {"children": [toggle_block]},
         )
-        logger.info(f"Notion: урок '{lesson_title}' записан в страницу {skill_page_id}")
+        logger.info(f"Notion (flat): урок '{lesson_title}' записан в {skill_page_id}")
 
     # ─────────────────────────────────────────────
     # Удаление страницы

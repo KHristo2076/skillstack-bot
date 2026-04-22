@@ -522,38 +522,46 @@ async def write_topic_to_notion(
       Трек (page) → Блок (toggle) → Тема (toggle) → Пункты (bullets)
 
     Вызывается из routes.py через BackgroundTasks после submit_topic.
+
+    Архитектура (как в submit_topic): БД-сессия короткая, Notion API вне сессии.
+    Notion бывает медленным (до 10 сек), нельзя держать коннект.
     """
     if not notion:
         return
+
     try:
+        # ── Шаг 1: получаем user_page_id из БД (или создаём если впервые) ──
         async with AsyncSessionLocal() as session:
-            # Корневая страница юзера
             res = await session.execute(
                 select(NotionPage).where(NotionPage.user_id == user_id)
             )
             notion_row = res.scalar_one_or_none()
+            existing_page_id = notion_row.page_id if notion_row else None
 
-            if notion_row is None:
-                page_id = await notion.create_user_page(username, user_id)
-                notion_row = NotionPage(
+        # ── Шаг 2: если нет страницы юзера — создаём в Notion (вне сессии БД) ──
+        if existing_page_id is None:
+            new_page_id = await notion.create_user_page(username, user_id)
+
+            # Сохраняем запись в БД — отдельной короткой сессией
+            async with AsyncSessionLocal() as session:
+                session.add(NotionPage(
                     user_id=user_id,
-                    page_id=page_id,
+                    page_id=new_page_id,
                     trial_started_at=datetime.utcnow(),
-                )
-                session.add(notion_row)
+                ))
                 await session.commit()
+            user_page_id = new_page_id
+        else:
+            user_page_id = existing_page_id
 
-            user_page_id = notion_row.page_id
-
-        # Страница трека (reuse существующий метод get_or_create_skill_page)
+        # ── Шаг 3: все Notion-операции — вне БД-сессий ──
         track_page_id = await notion.get_or_create_skill_page(user_page_id, track_name)
-
-        # В старом api был append_lesson — делает toggle с bullet'ами внутри.
-        # Для вложенности Блок→Тема нужен отдельный метод: сделаем в следующем файле
-        # (расширим NotionService). Пока — кладём тему прямо в страницу трека,
-        # а префикс блока в заголовке.
-        composed_title = f"[{block_title}] {topic_title}"
-        await notion.append_lesson(track_page_id, composed_title, theory)
+        await notion.append_topic_nested(
+            track_page_id=track_page_id,
+            block_title=block_title,
+            topic_title=topic_title,
+            theory_points=theory,
+        )
 
     except Exception as e:
-        logger.error(f"Notion write error для {user_id}: {e}")
+        logger.error(f"Notion write error для user {user_id}: {e}")
