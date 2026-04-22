@@ -13,7 +13,7 @@ import re
 from datetime import datetime
 
 from anthropic import AsyncAnthropic
-from sqlalchemy import select
+from sqlalchemy import case as sa_case, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
@@ -270,9 +270,14 @@ async def submit_topic(
     """
     Принимает ответы, проверяет каждый (AI если нужно),
     считает score, обновляет прогресс, разблокирует следующую тему.
+
+    Архитектура: две короткие сессии + AI-проверка в середине.
+    1) Сессия A: читаем Topic/Block/Track, вынимаем всё в плоские переменные
+    2) Без сессии: AI-проверка ответов (долго, не держим коннект)
+    3) Сессия B: пишем прогресс, разблокируем следующую, пересчитываем %
     """
+    # ── Сессия A: читаем контекст ──
     async with AsyncSessionLocal() as session:
-        # Загружаем тему с контентом
         res = await session.execute(
             select(Topic, Block, Track)
             .join(Block, Topic.block_id == Block.id)
@@ -288,9 +293,15 @@ async def submit_topic(
             logger.warning(f"Submit on topic {topic_id} without content")
             return None
 
+        # Вынимаем в обычные переменные — ORM-объекты после закрытия сессии detached
         questions = topic.content_json.get("questions", [])
+        block_id = block.id
+        block_order = block.order_num
+        track_id = track.id
+        total_topics = track.total_topics
+        topic_order = topic.order_num
 
-    # Проверяем ответы (возможно, с AI — вне сессии, чтобы не держать коннект)
+    # ── AI-проверка ответов (вне сессии) ──
     per_question: list[QuestionResult] = []
     total_score = 0.0
 
@@ -312,7 +323,7 @@ async def submit_topic(
     correct_count = sum(1 for r in per_question if r.correct)
     passed = score_pct >= PASS_THRESHOLD
 
-    # Обновляем БД
+    # ── Сессия B: записываем все изменения одной транзакцией ──
     async with AsyncSessionLocal() as session:
         # 1. UserTopicProgress для текущей темы
         stmt = pg_insert(UserTopicProgress).values(
@@ -335,35 +346,35 @@ async def submit_topic(
         )
         await session.execute(stmt)
 
-        # 2. Если passed — разблокировать следующую тему
+        # 2. Если passed — разблокируем следующую тему
         next_topic_id: int | None = None
         block_exam_available = False
 
         if passed:
             next_topic_id, block_exam_available = await _unlock_next_topic(
-                session, user_id, track.id, block.id, topic.order_num
+                session, user_id, track_id, block_id, block_order, topic_order
             )
 
         # 3. Пересчитать progress_pct трека
-        progress_pct = await _recalc_track_progress(session, user_id, track.id)
+        progress_pct = await _recalc_track_progress(
+            session, user_id, track_id, total_topics,
+        )
 
-        # 4. Streak +1 если passed
-        if passed:
-            ut_res = await session.execute(
-                select(UserTrack).where(
-                    UserTrack.user_id == user_id,
-                    UserTrack.track_id == track.id,
-                )
+        # 4. Обновить UserTrack (streak + last_activity + progress)
+        ut_res = await session.execute(
+            select(UserTrack).where(
+                UserTrack.user_id == user_id,
+                UserTrack.track_id == track_id,
             )
-            ut = ut_res.scalar_one_or_none()
-            if ut:
+        )
+        ut = ut_res.scalar_one_or_none()
+        if ut:
+            ut.progress_pct = progress_pct
+            ut.last_activity = datetime.utcnow()
+            if passed:
                 ut.streak += 1
-                ut.last_activity = datetime.utcnow()
 
         await session.commit()
-
-    # 5. Notion — в фоне логика вызывается из routes.py через BackgroundTasks
-    #    Возвращаем контент, чтобы route.py мог передать в write_to_notion
 
     return SubmitTopicResponse(
         topic_id=topic_id,
@@ -388,6 +399,7 @@ async def _unlock_next_topic(
     user_id: int,
     track_id: int,
     current_block_id: int,
+    current_block_order: int,
     current_topic_order: int,
 ) -> tuple[int | None, bool]:
     """
@@ -418,18 +430,11 @@ async def _unlock_next_topic(
 
     # Тем в блоке больше нет — block exam доступен
     # Ищем первую тему следующего блока (для подсказки после экзамена)
-    block_res = await session.execute(
-        select(Block).where(Block.id == current_block_id)
-    )
-    current_block = block_res.scalar_one_or_none()
-    if not current_block:
-        return None, False
-
     next_block_res = await session.execute(
         select(Block)
         .where(
             Block.track_id == track_id,
-            Block.order_num > current_block.order_num,
+            Block.order_num > current_block_order,
         )
         .order_by(Block.order_num)
         .limit(1)
@@ -446,7 +451,10 @@ async def _unlock_next_topic(
 
 
 async def _set_topic_status(session, user_id: int, topic_id: int, status: str):
-    """Ставит статус теме юзера. Если записи нет — создаёт."""
+    """
+    Ставит статус теме юзера. Если записи нет — создаёт.
+    Никогда не даунгрейдит passed → available (через CASE в SET).
+    """
     stmt = pg_insert(UserTopicProgress).values(
         user_id=user_id,
         topic_id=topic_id,
@@ -454,13 +462,14 @@ async def _set_topic_status(session, user_id: int, topic_id: int, status: str):
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=["user_id", "topic_id"],
-        set_={"status": stmt.excluded.status},
+        set_={
+            # Если уже passed — оставляем passed, иначе ставим новый статус
+            "status": sa_case(
+                (UserTopicProgress.status == "passed", "passed"),
+                else_=stmt.excluded.status,
+            ),
+        },
     )
-    # Но не даунгрейдим passed → available
-    # Это реализовано на уровне логики: _unlock_next_topic вызывается только
-    # для тем после passed, так что конфликт status='passed' → 'available' невозможен
-    # в нормальном флоу. Но на всякий случай можно добавить WHERE:
-    # stmt = stmt.where(UserTopicProgress.status != 'passed')
     await session.execute(stmt)
 
 
@@ -468,17 +477,22 @@ async def _set_topic_status(session, user_id: int, topic_id: int, status: str):
 # Пересчёт прогресса трека
 # ─────────────────────────────────────────────
 
-async def _recalc_track_progress(session, user_id: int, track_id: int) -> float:
-    """progress_pct = passed_topics / total_topics * 100"""
-    # total_topics из Track
-    track_res = await session.execute(select(Track).where(Track.id == track_id))
-    track = track_res.scalar_one_or_none()
-    if not track or track.total_topics == 0:
+async def _recalc_track_progress(
+    session,
+    user_id: int,
+    track_id: int,
+    total_topics: int,
+) -> float:
+    """
+    Считает progress_pct = passed_topics / total_topics * 100.
+    Ничего не мутирует — UserTrack обновляет вызывающий код.
+    """
+    if total_topics == 0:
         return 0.0
 
-    # Считаем passed
+    # Считаем passed-темы юзера в этом треке
     passed_res = await session.execute(
-        select(UserTopicProgress)
+        select(UserTopicProgress.id)
         .join(Topic, UserTopicProgress.topic_id == Topic.id)
         .join(Block, Topic.block_id == Block.id)
         .where(
@@ -488,20 +502,7 @@ async def _recalc_track_progress(session, user_id: int, track_id: int) -> float:
         )
     )
     passed_count = len(passed_res.scalars().all())
-    progress_pct = (passed_count / track.total_topics) * 100
-
-    # Сохраняем в UserTrack
-    ut_res = await session.execute(
-        select(UserTrack).where(
-            UserTrack.user_id == user_id,
-            UserTrack.track_id == track_id,
-        )
-    )
-    ut = ut_res.scalar_one_or_none()
-    if ut:
-        ut.progress_pct = progress_pct
-
-    return progress_pct
+    return (passed_count / total_topics) * 100
 
 
 # ─────────────────────────────────────────────

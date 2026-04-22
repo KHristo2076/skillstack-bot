@@ -5,7 +5,6 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.bot import bot_service
-from app.database import init_db
 from app.routes import router
 
 logging.basicConfig(level=logging.INFO)
