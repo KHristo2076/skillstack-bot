@@ -41,6 +41,11 @@ class NotionService:
     async def _post(self, url: str, payload: dict) -> dict:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(url, headers=self.headers, json=payload)
+            if r.status_code >= 400:
+                # Логируем тело ответа Notion — там подробный error message
+                logger.error(
+                    f"Notion API error {r.status_code} on POST {url}: {r.text[:500]}"
+                )
             r.raise_for_status()
             return r.json()
 
@@ -217,16 +222,31 @@ class NotionService:
                 return
 
         # 3. Bullet-пункты внутри toggle темы
-        bullet_children = [
-            {
-                "object": "block",
-                "type": "bulleted_list_item",
-                "bulleted_list_item": {
-                    "rich_text": [{"type": "text", "text": {"content": point}}]
-                },
-            }
-            for point in theory_points
-        ]
+        # Notion API: rich_text.content ≤ 2000 символов. Режем с запасом.
+        MAX_TEXT = 1900
+
+        def _safe_chunk(text: str, max_len: int = MAX_TEXT) -> list[str]:
+            """Режет длинный текст на куски ≤ max_len."""
+            if not text:
+                return [""]
+            if len(text) <= max_len:
+                return [text]
+            return [text[i : i + max_len] for i in range(0, len(text), max_len)]
+
+        bullet_children = []
+        for point in theory_points:
+            # Один пункт может превысить лимит — дробим на несколько bullet'ов
+            for chunk in _safe_chunk(str(point)):
+                bullet_children.append({
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": [{"type": "text", "text": {"content": chunk}}]
+                    },
+                })
+
+        # Название темы тоже режем (вдруг слишком длинное)
+        safe_topic_title = needle_topic[:MAX_TEXT]
 
         # 4. Toggle темы с bullet'ами
         topic_toggle = {
@@ -236,7 +256,7 @@ class NotionService:
                 "rich_text": [
                     {
                         "type": "text",
-                        "text": {"content": needle_topic},
+                        "text": {"content": safe_topic_title},
                         "annotations": {"bold": True},
                     }
                 ],
