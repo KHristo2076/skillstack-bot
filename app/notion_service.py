@@ -16,6 +16,7 @@ notion_service.py
               └── • ...
 """
 
+import asyncio
 import logging
 import httpx
 
@@ -39,15 +40,40 @@ class NotionService:
     # ─────────────────────────────────────────────
 
     async def _post(self, url: str, payload: dict) -> dict:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(url, headers=self.headers, json=payload)
-            if r.status_code >= 400:
-                # Логируем тело ответа Notion — там подробный error message
+        """
+        POST с ретраем на "invalid_request_url" — это частая ошибка Notion API
+        когда пишешь в только что созданный блок: Notion ещё не проиндексировал его.
+        Делаем до 3 попыток с возрастающей задержкой.
+        """
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(url, headers=self.headers, json=payload)
+                if r.status_code < 400:
+                    return r.json()
+
+                body = r.text
+                # Ретраим только invalid_request_url — это eventual consistency
+                if (
+                    r.status_code == 400
+                    and "invalid_request_url" in body
+                    and attempt < 2
+                ):
+                    delay = 0.5 * (attempt + 1)  # 0.5s, 1.0s
+                    logger.warning(
+                        f"Notion invalid_request_url, retry in {delay}s "
+                        f"(attempt {attempt + 1}/3)"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Другие ошибки либо все ретраи — логируем и пробрасываем
                 logger.error(
-                    f"Notion API error {r.status_code} on POST {url}: {r.text[:500]}"
+                    f"Notion API error {r.status_code} on POST {url}: {body[:500]}"
                 )
-            r.raise_for_status()
-            return r.json()
+                r.raise_for_status()
+
+        # Защитная заглушка (сюда не должны дойти)
+        raise RuntimeError("Notion POST: unreachable code")
 
     async def _patch(self, url: str, payload: dict) -> dict:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -86,7 +112,10 @@ class NotionService:
             ],
         }
         data = await self._post("https://api.notion.com/v1/pages", payload)
-        return data["id"]
+        new_page_id = data["id"]
+        # Пауза на индексацию (как в get_or_create_skill_page)
+        await asyncio.sleep(0.6)
+        return new_page_id
 
     async def get_or_create_skill_page(self, user_page_id: str, skill: str) -> str:
         """
@@ -116,7 +145,12 @@ class NotionService:
             ],
         }
         data = await self._post("https://api.notion.com/v1/pages", payload)
-        return data["id"]
+        new_page_id = data["id"]
+        # Страница свежесозданная — Notion нужно время на индексацию,
+        # иначе следующий запрос на children этой страницы падает
+        # с "invalid_request_url". Ретраи в _post — запасной парашют.
+        await asyncio.sleep(0.6)
+        return new_page_id
 
     # ─────────────────────────────────────────────
     # ВЛОЖЕННАЯ ЗАПИСЬ: Блок → Тема → Пункты (v2)
