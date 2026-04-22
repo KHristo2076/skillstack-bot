@@ -39,47 +39,47 @@ class NotionService:
     # Низкоуровневые методы
     # ─────────────────────────────────────────────
 
-    async def _post(self, url: str, payload: dict) -> dict:
+    async def _request(self, method: str, url: str, payload: dict | None = None) -> dict:
         """
-        POST с ретраем на "invalid_request_url" — это частая ошибка Notion API
-        когда пишешь в только что созданный блок: Notion ещё не проиндексировал его.
-        Делаем до 3 попыток с возрастающей задержкой.
+        Универсальный HTTP-запрос с ретраем на invalid_request_url (Notion eventual consistency).
+        method: 'POST' или 'PATCH'.
         """
         for attempt in range(3):
             async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.post(url, headers=self.headers, json=payload)
+                r = await client.request(
+                    method, url, headers=self.headers, json=payload,
+                )
                 if r.status_code < 400:
                     return r.json()
 
                 body = r.text
-                # Ретраим только invalid_request_url — это eventual consistency
                 if (
                     r.status_code == 400
                     and "invalid_request_url" in body
                     and attempt < 2
                 ):
-                    delay = 0.5 * (attempt + 1)  # 0.5s, 1.0s
+                    delay = 0.5 * (attempt + 1)
                     logger.warning(
-                        f"Notion invalid_request_url, retry in {delay}s "
+                        f"Notion invalid_request_url on {method} {url}, retry in {delay}s "
                         f"(attempt {attempt + 1}/3)"
                     )
                     await asyncio.sleep(delay)
                     continue
 
-                # Другие ошибки либо все ретраи — логируем и пробрасываем
                 logger.error(
-                    f"Notion API error {r.status_code} on POST {url}: {body[:500]}"
+                    f"Notion API error {r.status_code} on {method} {url}: {body[:500]}"
                 )
                 r.raise_for_status()
 
-        # Защитная заглушка (сюда не должны дойти)
-        raise RuntimeError("Notion POST: unreachable code")
+        raise RuntimeError(f"Notion {method}: unreachable code")
+
+    async def _post(self, url: str, payload: dict) -> dict:
+        """POST — для создания страниц."""
+        return await self._request("POST", url, payload)
 
     async def _patch(self, url: str, payload: dict) -> dict:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.patch(url, headers=self.headers, json=payload)
-            r.raise_for_status()
-            return r.json()
+        """PATCH — для append block children (и архивации страниц)."""
+        return await self._request("PATCH", url, payload)
 
     async def _get(self, url: str) -> dict:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -214,7 +214,7 @@ class NotionService:
                 "children": [],
             },
         }
-        data = await self._post(
+        data = await self._patch(
             f"https://api.notion.com/v1/blocks/{track_page_id}/children",
             {"children": [toggle_block]},
         )
@@ -299,7 +299,7 @@ class NotionService:
         }
 
         # 5. Добавляем topic-toggle внутрь toggle блока
-        await self._post(
+        await self._patch(
             f"https://api.notion.com/v1/blocks/{block_toggle_id}/children",
             {"children": [topic_toggle]},
         )
@@ -345,7 +345,7 @@ class NotionService:
                 "children": bullet_children,
             },
         }
-        await self._post(
+        await self._patch(
             f"https://api.notion.com/v1/blocks/{skill_page_id}/children",
             {"children": [toggle_block]},
         )
