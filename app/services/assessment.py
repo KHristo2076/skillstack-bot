@@ -15,11 +15,10 @@ import logging
 import re
 from datetime import datetime
 
-from anthropic import AsyncAnthropic
 from sqlalchemy import case as sa_case, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from app.services.llm import llm_client
 
-from app.config import settings
 from app.database import (
     AsyncSessionLocal, Assessment, Block, Topic, Track,
     UserTopicProgress, UserTrack,
@@ -31,7 +30,6 @@ from app.services.ai_check import check_answer
 from app.services.topic import _pick_question_types  # переиспользуем логику типов
 
 logger = logging.getLogger(__name__)
-anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 
 LEVEL_LABELS = {
@@ -98,13 +96,11 @@ async def _generate_assessment(track: Track) -> list[dict]:
   "questions": [ ... 7 объектов ... ]
 }}"""
 
-    response = await anthropic_client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=3000,
+    raw = await llm_client.generate(
         system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
+        user=user_prompt,
+        max_tokens=3000,
     )
-    raw = response.content[0].text
     data = _parse_json(raw)
 
     questions = data.get("questions", [])
@@ -395,13 +391,11 @@ async def _generate_summary(
             f"{'Стартует с темы: ' + start_topic_title if start_topic_title else 'Все темы освоены!'}\n\n"
             "Напиши короткое резюме для ученика: где он силён, что его ждёт. Без эмодзи."
         )
-        response = await anthropic_client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=250,
+        return (await llm_client.generate(
             system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        return response.content[0].text.strip()
+            user=user_prompt,
+            max_tokens=250,
+        )).strip()
     except Exception as e:
         logger.error(f"Summary generation failed: {e}")
         return f"Твой уровень: {level_ru}. Пропущено {skipped_count} тем, которые ты уже знаешь. Продолжай!"

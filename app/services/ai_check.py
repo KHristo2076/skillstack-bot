@@ -16,13 +16,9 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import Any
-
-from anthropic import AsyncAnthropic
-
-from app.config import settings
+from app.services.llm import llm_client
 
 logger = logging.getLogger(__name__)
-anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 
 @dataclass
@@ -178,13 +174,11 @@ async def _check_with_ai(q: dict, user_answer: Any) -> CheckResult:
 }}"""
 
     try:
-        response = await anthropic_client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=300,
+        raw = await llm_client.generate(
             system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
+            user=user_prompt,
+            max_tokens=300,
         )
-        raw = response.content[0].text
         data = _parse_ai_json(raw)
 
         correct = bool(data.get("correct", False))

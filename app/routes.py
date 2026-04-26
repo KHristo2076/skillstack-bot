@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import delete, select
 from telegram import Update
 
+from app.services.llm import llm_client
 from app.bot import bot_service
 from app.config import settings
 from app.database import AsyncSessionLocal, NotionPage, UserPremium
@@ -35,13 +36,9 @@ from app.services import curriculum as curriculum_svc
 from app.services import topic as topic_svc
 from app.services.topic import write_topic_to_notion
 
-# AI-ментор использует тот же клиент
-from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 # Notion (опционально)
 notion: NotionService | None = None
@@ -232,17 +229,16 @@ async def ask_ai(data: AskAIRequest):
     context_block = f"\nТема:\n{data.lesson_context}\n" if data.lesson_context else ""
 
     try:
-        response = await anthropic_client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=400,
+        answer = await llm_client.generate(
             system=(
                 f"Ты — AI-ментор по теме \"{data.skill}\" в SkillStack.\n"
                 f"{context_block}\n"
                 "Отвечай коротко (2-4 предложения), дружелюбно, на \"ты\", на русском."
             ),
-            messages=[{"role": "user", "content": data.question}],
+            user=data.question,
+            max_tokens=400,
         )
-        return AskAIResponse(answer=response.content[0].text.strip())
+        return AskAIResponse(answer=answer.strip())
     except Exception as e:
         logger.error(f"AI-ментор ошибка: {e}")
         return AskAIResponse(answer="Не смог ответить. Попробуй переформулировать!")
