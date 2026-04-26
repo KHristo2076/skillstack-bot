@@ -8,21 +8,24 @@ HTTP API SkillStack v2.
   Оценка:   /start-assessment, /submit-assessment
   AI:       /ask-ai
   Notion:   /notion-link, /cron/cleanup-expired-trials
+  Cron:     /cron/daily-reminder
   Прочее:   /webhook, /app, /
 """
 
+import asyncio
 import logging
+import random
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, select
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 
 from app.services.llm import llm_client
 from app.bot import bot_service
 from app.config import settings
-from app.database import AsyncSessionLocal, NotionPage, UserPremium
+from app.database import AsyncSessionLocal, NotionPage, Track, UserPremium
 from app.notion_service import NotionService
 from app.schemas import (
     AskAIRequest, AskAIResponse,
@@ -337,6 +340,66 @@ async def cleanup_expired_trials(request: Request):
 
 
 # ─────────────────────────────────────────────
+# DAILY REMINDER
+# ─────────────────────────────────────────────
+
+_REMINDER_MESSAGES = [
+    "🧠 Знания не ржавеют, но без практики тускнеют.\nЗаходи — продолжим прокачивать навыки!",
+    "🚀 Ещё один шаг к цели — это всего пара минут в SkillStack.\nНе останавливайся!",
+    "💡 Лучшее время учиться — прямо сейчас.\nОткрой SkillStack и пройди следующий урок!",
+    "🎯 Регулярность важнее интенсивности.\nЗайди сегодня — даже 5 минут в счёт!",
+    "📈 Твой прогресс не стоит на месте, пока ты учишься.\nПродолжим?",
+    "🔥 Маленький шаг каждый день = большой результат через месяц.\nВперёд!",
+    "⚡ Сегодня хороший день, чтобы стать чуть лучше вчерашней версии себя.",
+    "🌱 Каждый урок — это инвестиция в себя.\nОткрой SkillStack и прокачайся!",
+    "🏆 Профессионалы учатся каждый день.\nТы в хорошей компании — заходи!",
+    "📚 Новые знания ждут тебя.\nОткрой мини-приложение и продолжи обучение!",
+]
+
+
+@router.post("/cron/daily-reminder")
+async def daily_reminder(request: Request):
+    """Ежедневный cron (запускать в 16:00).
+    Отправляет мотивирующее напоминание всем пользователям
+    в случайное время в диапазоне 16:00–18:00.
+    """
+    secret = request.headers.get("X-Cron-Secret", "")
+    if secret != settings.bot_token[:16]:
+        return {"error": "Unauthorized"}
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Track.user_id).distinct())
+        user_ids: list[int] = list(result.scalars().all())
+
+    async def _send_all():
+        delay = random.randint(0, 7200)   # случайная задержка 0–2 часа
+        await asyncio.sleep(delay)
+
+        keyboard = [[InlineKeyboardButton(
+            text="🚀 Открыть SkillStack",
+            web_app=WebAppInfo(url=settings.webapp_url),
+        )]]
+        markup = InlineKeyboardMarkup(keyboard)
+
+        sent = 0
+        for uid in user_ids:
+            text = random.choice(_REMINDER_MESSAGES)
+            try:
+                await bot_service.application.bot.send_message(
+                    chat_id=uid,
+                    text=text,
+                    reply_markup=markup,
+                )
+                sent += 1
+            except Exception as e:
+                logger.error(f"daily_reminder → {uid}: {e}")
+        logger.info(f"daily_reminder: sent {sent}/{len(user_ids)}")
+
+    asyncio.create_task(_send_all())
+    return {"scheduled": len(user_ids)}
+
+
+# ─────────────────────────────────────────────
 # STATIC
 # ─────────────────────────────────────────────
 
@@ -345,10 +408,6 @@ async def serve_miniapp():
     return FileResponse(
         "static/index.html",
         headers={
-            # Запрещаем кэширование index.html — он ссылается на
-            # assets/index-XXXX.js с hash-именем, которое меняется при каждом
-            # билде. Если index.html кэшируется, Telegram/браузер будет
-            # просить несуществующие старые ассеты → "Not Found" / чёрный экран.
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
