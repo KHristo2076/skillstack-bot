@@ -16,6 +16,7 @@ from app.services.llm import llm_client
 from sqlalchemy import case as sa_case, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.config import settings
 from app.database import (
     AsyncSessionLocal, Block, NotionPage, Topic, Track,
     UserTopicProgress, UserTrack,
