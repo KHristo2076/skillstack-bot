@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     bot_token: str
     webapp_url: str
     database_url: str
-    anthropic_api_key: str
+    openai_api_key: str
     notion_token: str = ""       
     notion_root_page_id: str = ""
 

@@ -12,18 +12,16 @@ import json
 import logging
 import re
 
-from anthropic import AsyncAnthropic
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.config import settings
 from app.database import (
     AsyncSessionLocal, Block, Topic, Track, UserTopicProgress, UserTrack,
 )
 from app.schemas import BlockItem, MyTrackItem, TopicItem, TrackOverview
+from app.services.llm import llm_client
 
 logger = logging.getLogger(__name__)
-anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 
 # ─────────────────────────────────────────────
@@ -104,13 +102,11 @@ async def generate_curriculum(skill: str) -> dict:
   ]
 }}"""
 
-    response = await anthropic_client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=3000,
+    raw = await llm_client.generate(
         system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
+        user=user_prompt,
+        max_tokens=3000,
     )
-    raw = response.content[0].text
     data = _safe_parse_json(raw)
     if not _validate_curriculum(data):
         raise ValueError(f"Невалидная структура curriculum: {list(data.keys())}")
